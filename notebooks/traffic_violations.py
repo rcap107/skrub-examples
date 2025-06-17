@@ -3,28 +3,26 @@ import polars as pl
 import skrub
 
 from skrub import TableReport, Cleaner
+from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
 
 # %%
-data = skrub.datasets.fetch_traffic_violations().traffic_violations
-data = pl.from_pandas(data.sample(10000, random_state=42))
-# %%
-# The target variable contains 4 distinct values, but we will treat it as a
-# binary classification problem by dropping the two least frequent classes.
-data = data.filter(~pl.col("violation_type").is_in(["SERO", "ESERO"]))
+df = pl.read_parquet("../_scratch/traffic_violations_train.parquet")
+df = df.filter(~pl.col("violation_type").is_in(["SERO", "ESERO"]))
+data = skrub.var("data", df)#.skb.subsample(1000)
 # We first convert X and y into skrub expressions.
-X = skrub.var("data", data.drop("violation_type")).skb.mark_as_X()
-y = skrub.var("target", data["violation_type"]).skb.mark_as_y()
+X = data.drop("violation_type").skb.mark_as_X()
+y = data["violation_type"].skb.mark_as_y()
+
+y = y.to_numpy().reshape(-1, 1).skb.apply(OrdinalEncoder())
+
 
 # %%
 # We can convert columns that contain dates and drop uninformative columns using the Cleaner.
-c = Cleaner(drop_null_fraction=0.9, drop_if_constant=True)
+c = Cleaner(drop_null_fraction=0.9, drop_if_constant=True, numeric_dtype="float32")
 
-X_ = (
-    X.with_columns(pl.col("date_of_stop") + " " + pl.col("time_of_stop"))
-    .drop("time_of_stop")   
-    .skb.apply(c)
-)
-X_ = X_.sort("date_of_stop", descending=False)
+X_ = X.skb.apply(c)
+
+X_ = X_.sort("date", descending=False)
 
 # %%
 import skrub.selectors as s
@@ -41,11 +39,10 @@ def convert_to_binary(df):
         )
     return df
 
-# %%
 binary_cols = X_.skb.select(binary).skb.apply_func(convert_to_binary)
 
 converted = X_.skb.select(~binary).skb.concat([binary_cols], axis=1)
-converted
+# converted
 # %%
 # Drop more columnns that are not informative.
 preprocessed = converted.drop(
@@ -82,7 +79,7 @@ num_encoder = skrub.choose_from(
             SimpleImputer(),
             KBinsDiscretizer(n_bins=10, encode="ordinal", strategy="quantile"),
         ),
-        "passthrough": make_pipeline(SimpleImputer()),
+        "passthrough": SimpleImputer(),
     },
     name="num_encoder",
 )
@@ -107,7 +104,6 @@ everything_else = preprocessed.skb.select(
     cols=leftover
 ).skb.apply(TableVectorizer(), cols=leftover).skb.apply(postprocess)
 
-# %%
 
 encoded = (
     everything_else.skb.concat([dates, strings, numbers], axis=1)
@@ -122,15 +118,14 @@ cv = TimeSeriesSplit(
     n_splits=5,
     max_train_size=None,
     gap=0,
-    test_size=1000,
 )
-
+#%%
 model = skrub.choose_from(
     {
-        "logistic": LogisticRegression(max_iter=500,
-            # max_iter=skrub.choose_int(100, 1000, log=True, name="max_iter"),
-            C=skrub.choose_float(0.5, 10, log=True, name="C", n_steps=3),
-        ),
+        # "logistic": LogisticRegression(max_iter=500,
+        #     # max_iter=skrub.choose_int(100, 1000, log=True, name="max_iter"),
+        #     C=skrub.choose_float(0.5, 10, log=True, name="C", n_steps=3),
+        # ),
         "hgb": HistGradientBoostingClassifier(
             learning_rate=skrub.choose_float(0.01, 0.9, log=True, name="lr")
         ),
@@ -138,12 +133,38 @@ model = skrub.choose_from(
     name="model",
 )
 # %%
-predicted = encoded.skb.apply(model, y=y)
+predicted = encoded.skb.apply(model, y=y.ravel())
 
 # %%
 search = predicted.skb.get_randomized_search(
-    n_jobs=4, fitted=True, n_iter=32, random_state=1, scoring="roc_auc", cv=cv
+    n_jobs=4, fitted=True, n_iter=8, random_state=1, scoring="roc_auc", cv=cv,
 )
 # %%
 search.plot_results()
+# %%
+search.detailed_results_   
+# %%
+import pickle
+
+saved_model = pickle.dumps(search.best_pipeline_)
+
+# %%
+new_df = pl.read_parquet("../_scratch/traffic_violations_test.parquet")
+new_df = new_df.filter(~pl.col("violation_type").is_in(["SERO", "ESERO"]))
+new_data = skrub.var("data", new_df)#.skb.subsample(1000)
+
+loaded_model = pickle.loads(saved_model)
+pred = loaded_model.score({"data": new_df})
+# %%
+skrub.cross_validate(search, predicted.skb.get_data(), cv=cv)
+# %%
+from sklearn.dummy import DummyClassifier
+
+dummy = DummyClassifier()
+
+dummy.fit(df, df["violation_type"])
+# %%
+dummy.score(new_df, new_df["violation_type"])
+# %%
+skrub.cross_validate(loaded_model, {"data": new_df})
 # %%
